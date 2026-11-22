@@ -1,19 +1,21 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { SceneManager, GuitarState } from './three/SceneManager';
-import { TrackingPipeline, TrackingData } from './vision/TrackingPipeline';
+import { HolisticPipeline, HolisticFrameData, BiomechanicalTelemetry } from './vision/HolisticPipeline';
 import { AcousticGuitarEngine } from './audio/KarplusStrong';
 import { UIOverlay } from './components/UIOverlay';
 import { GuitarTransform } from './math/Kinematics';
+import { FullBodySkeletonData } from './three/SkeletonRig';
 import { Play } from 'lucide-react';
+import { Vector3D } from './math/OneEuroFilter';
 
 export const App: React.FC = () => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
-  // Engine instances
+  // Engines
   const sceneManagerRef = useRef<SceneManager | null>(null);
   const audioEngineRef = useRef<AcousticGuitarEngine | null>(null);
-  const trackingPipelineRef = useRef<TrackingPipeline | null>(null);
+  const holisticPipelineRef = useRef<HolisticPipeline | null>(null);
 
   // UI state
   const [isAudioStarted, setIsAudioStarted] = useState(false);
@@ -21,24 +23,37 @@ export const App: React.FC = () => {
   const [guitarState, setGuitarState] = useState<GuitarState>('HOLDING');
   const [fps, setFps] = useState(60);
   const [lastStrum, setLastStrum] = useState<{ direction: 'down' | 'up'; velocity: number } | null>(null);
+  const [lastPhysicalHitString, setLastPhysicalHitString] = useState<number | null>(null);
+  const [showSkeleton, setShowSkeleton] = useState(true);
   const [isMuted, setIsMuted] = useState(false);
+  const [telemetry, setTelemetry] = useState<BiomechanicalTelemetry>({
+    leftElbowAngleDeg: 90,
+    rightElbowAngleDeg: 90,
+    leftShoulderAngleDeg: 45,
+    spineTiltDeg: 0,
+    jointsTrackedCount: 0,
+    estimatedFloorLevelY: -0.85,
+  });
 
-  // Transform received from tracking loop
+  // State shared with render loop
   const latestTransformRef = useRef<GuitarTransform | null>(null);
+  const latestSkeletonRef = useRef<FullBodySkeletonData>({
+    poseLandmarks: null,
+    leftHandLandmarks: null,
+    rightHandLandmarks: null,
+  });
+  const latestRightHandRef = useRef<Vector3D[] | null>(null);
 
-  // Initialize Audio & 3D Scene
+  // Initialize Three.js scene & Audio
   useEffect(() => {
     if (!canvasRef.current) return;
 
-    // 1. Create Three.js Scene
     const sceneManager = new SceneManager(canvasRef.current);
     sceneManagerRef.current = sceneManager;
 
-    // 2. Create Acoustic Audio Engine
     const audioEngine = new AcousticGuitarEngine();
     audioEngineRef.current = audioEngine;
 
-    // 3. Render Loop
     let animationFrameId: number;
     let lastTime = performance.now();
 
@@ -46,7 +61,23 @@ export const App: React.FC = () => {
       const deltaTime = Math.min(0.05, (time - lastTime) / 1000);
       lastTime = time;
 
-      sceneManager.update(deltaTime, latestTransformRef.current);
+      // Update scene with 75-joint skeleton & check physical string collisions
+      const collisions = sceneManager.update(
+        deltaTime,
+        latestSkeletonRef.current,
+        latestTransformRef.current,
+        latestRightHandRef.current
+      );
+
+      // Trigger Karplus-Strong string sound on physical collision
+      if (collisions.length > 0 && audioEngineRef.current) {
+        for (const hit of collisions) {
+          audioEngineRef.current.pluckString(hit.stringIndex, hit.velocity);
+          setLastPhysicalHitString(hit.stringIndex);
+          setTimeout(() => setLastPhysicalHitString(null), 150);
+        }
+      }
+
       animationFrameId = requestAnimationFrame(renderLoop);
     };
 
@@ -55,40 +86,43 @@ export const App: React.FC = () => {
     return () => {
       cancelAnimationFrame(animationFrameId);
       sceneManager.destroy();
-      trackingPipelineRef.current?.stop();
+      holisticPipelineRef.current?.stop();
     };
   }, []);
 
-  // Handle tracking updates from MediaPipe
-  const handleTrackingFrame = useCallback((data: TrackingData) => {
+  // Handle Holistic 75-joint frames
+  const handleHolisticFrame = useCallback((data: HolisticFrameData) => {
     setFps(data.fps);
+    setTelemetry(data.telemetry);
 
-    // 1. Update Active Chord
+    // 1. Store full skeleton data for 3D render loop
+    latestSkeletonRef.current = {
+      poseLandmarks: data.poseLandmarks,
+      leftHandLandmarks: data.leftHandLandmarks,
+      rightHandLandmarks: data.rightHandLandmarks,
+    };
+    latestRightHandRef.current = data.rightHandLandmarks;
+
+    // 2. Update Floor Level
+    if (sceneManagerRef.current && data.telemetry.estimatedFloorLevelY) {
+      sceneManagerRef.current.setFloorLevel(data.telemetry.estimatedFloorLevelY);
+    }
+
+    // 3. Update Active Chord
     if (data.activeChord && data.activeChord !== activeChord) {
       setActiveChord(data.activeChord);
       audioEngineRef.current?.setChord(data.activeChord);
     }
 
-    // 2. Solve Kinematics if Pose is available
-    if (data.pose && sceneManagerRef.current) {
-      const transform = sceneManagerRef.current.kinematics.computeTransform(data.pose);
+    // 4. Solve Kinematics
+    if (data.kinematicsPose && sceneManagerRef.current) {
+      const transform = sceneManagerRef.current.kinematics.computeTransform(data.kinematicsPose);
       latestTransformRef.current = transform;
     }
 
-    // 3. Handle Strums
-    if (data.strumDetected && sceneManagerRef.current && audioEngineRef.current) {
-      const { direction, velocity } = data.strumDetected;
-      setLastStrum({ direction, velocity });
-
-      audioEngineRef.current.strum(direction, velocity, (strIndex) => {
-        sceneManagerRef.current?.guitar.vibrateString(strIndex, velocity);
-      });
-    }
-
-    // 4. Handle Spatial Gestures (Wall Placement vs Grip)
+    // 5. Handle Gestures
     if (sceneManagerRef.current) {
       const currentState = sceneManagerRef.current.getState();
-
       if (data.placeGestureDetected && currentState === 'HOLDING') {
         sceneManagerRef.current.setState('PLACED_RESTING');
         setGuitarState('PLACED_RESTING');
@@ -99,7 +133,6 @@ export const App: React.FC = () => {
     }
   }, [activeChord]);
 
-  // Start Camera & Audio on user click (browser security requirement)
   const handleStartExperience = async () => {
     try {
       if (audioEngineRef.current) {
@@ -107,17 +140,16 @@ export const App: React.FC = () => {
         setIsAudioStarted(true);
       }
 
-      if (videoRef.current && !trackingPipelineRef.current) {
-        const pipeline = new TrackingPipeline(videoRef.current);
-        trackingPipelineRef.current = pipeline;
-        await pipeline.start(handleTrackingFrame);
+      if (videoRef.current && !holisticPipelineRef.current) {
+        const pipeline = new HolisticPipeline(videoRef.current);
+        holisticPipelineRef.current = pipeline;
+        await pipeline.start(handleHolisticFrame);
       }
     } catch (err) {
       console.error('Failed to start camera or audio:', err);
     }
   };
 
-  // Manual strum testing
   const handleManualStrum = (direction: 'down' | 'up') => {
     if (audioEngineRef.current && sceneManagerRef.current) {
       const velocity = 0.85;
@@ -128,7 +160,12 @@ export const App: React.FC = () => {
     }
   };
 
-  // Toggle Mute
+  const handleToggleSkeleton = () => {
+    const nextVal = !showSkeleton;
+    setShowSkeleton(nextVal);
+    sceneManagerRef.current?.toggleSkeleton(nextVal);
+  };
+
   const handleToggleMute = () => {
     if (audioEngineRef.current) {
       const nextMuted = !isMuted;
@@ -137,7 +174,6 @@ export const App: React.FC = () => {
     }
   };
 
-  // Direct State Change (from button)
   const handleStateChange = (newState: GuitarState) => {
     if (sceneManagerRef.current) {
       sceneManagerRef.current.setState(newState);
@@ -152,10 +188,10 @@ export const App: React.FC = () => {
         ref={videoRef}
         playsInline
         muted
-        className="absolute inset-0 w-full h-full object-cover transform -scale-x-100 opacity-80"
+        className="absolute inset-0 w-full h-full object-cover transform -scale-x-100 opacity-75"
       />
 
-      {/* 3D WebGL Overlay Canvas */}
+      {/* 3D WebGL Overlay Canvas (Guitar + 75-Joint MoCap Skeleton + Room Spatial Grid) */}
       <canvas
         ref={canvasRef}
         className="absolute inset-0 w-full h-full z-10 pointer-events-none"
@@ -169,7 +205,11 @@ export const App: React.FC = () => {
             guitarState={guitarState}
             fps={fps}
             lastStrum={lastStrum}
+            lastPhysicalHitString={lastPhysicalHitString}
+            telemetry={telemetry}
+            showSkeleton={showSkeleton}
             isMuted={isMuted}
+            onToggleSkeleton={handleToggleSkeleton}
             onToggleMute={handleToggleMute}
             onStateChange={handleStateChange}
             onManualStrum={handleManualStrum}
@@ -177,43 +217,43 @@ export const App: React.FC = () => {
         </div>
       )}
 
-      {/* Initial Landing / Permission Screen */}
+      {/* Landing / Permission Screen */}
       {!isAudioStarted && (
         <div className="absolute inset-0 z-30 flex items-center justify-center bg-background/90 backdrop-blur-xl p-6">
           <div className="max-w-md w-full bg-surface border border-white/10 rounded-2xl p-8 shadow-2xl flex flex-col items-center text-center gap-6">
-            <div className="w-16 h-16 rounded-2xl bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-amber-400">
+            <div className="w-16 h-16 rounded-2xl bg-cyan-500/10 border border-cyan-500/20 flex items-center justify-center text-cyan-400">
               <Play className="w-8 h-8 ml-1" />
             </div>
 
             <div>
               <h2 className="text-2xl font-bold text-white tracking-tight">
-                Welcome to Airmelo
+                Airmelo MoCap Studio
               </h2>
               <p className="text-sm text-gray-400 mt-2 leading-relaxed">
-                Hyper-realistic spatial air guitar powered by MediaPipe 3D tracking, One-Euro jitter suppression, and Web Audio string physics.
+                Full-body 75-joint biomechanical tracking with real-time 3D finger-to-string physical colliders and Karplus-Strong acoustic physics.
               </p>
             </div>
 
             <div className="w-full bg-surface-highlight/50 border border-white/5 rounded-xl p-4 text-xs font-mono text-gray-300 text-left flex flex-col gap-2">
               <div className="flex items-center gap-2">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-                <span>Zero-latency Web Audio API</span>
+                <span className="w-1.5 h-1.5 rounded-full bg-cyan-400" />
+                <span>Full-Body Holistic 75-Joint Rigging</span>
               </div>
               <div className="flex items-center gap-2">
                 <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
-                <span>One-Euro Zero-Jitter Filter</span>
+                <span>3D Physical Finger-String Colliders</span>
               </div>
               <div className="flex items-center gap-2">
-                <span className="w-1.5 h-1.5 rounded-full bg-cyan-400" />
-                <span>Persistent 6-DoF Room Anchoring</span>
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                <span>Real-Time Biomechanical Telemetry & Room Grid</span>
               </div>
             </div>
 
             <button
               onClick={handleStartExperience}
-              className="w-full py-3.5 px-6 bg-amber-500 hover:bg-amber-400 text-black font-semibold rounded-xl transition-all duration-200 shadow-lg shadow-amber-500/20 flex items-center justify-center gap-2"
+              className="w-full py-3.5 px-6 bg-cyan-500 hover:bg-cyan-400 text-black font-semibold rounded-xl transition-all duration-200 shadow-lg shadow-cyan-500/20 flex items-center justify-center gap-2"
             >
-              <span>Enable Camera & Audio</span>
+              <span>Launch MoCap Air Studio</span>
             </button>
           </div>
         </div>

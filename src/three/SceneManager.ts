@@ -1,6 +1,9 @@
 import * as THREE from 'three';
 import { ProceduralGuitar3D } from './GuitarModel';
 import { GuitarKinematics, GuitarTransform } from '../math/Kinematics';
+import { SkeletonRig, FullBodySkeletonData } from './SkeletonRig';
+import { PhysicalStringColliders, StringCollisionEvent } from './PhysicalColliders';
+import { Vector3D } from '../math/OneEuroFilter';
 
 export type GuitarState = 'HOLDING' | 'PLACED_RESTING' | 'PROXIMITY_HOVER';
 
@@ -10,6 +13,8 @@ export class SceneManager {
   public renderer: THREE.WebGLRenderer;
   public guitar: ProceduralGuitar3D;
   public kinematics: GuitarKinematics;
+  public skeletonRig: SkeletonRig;
+  public colliders: PhysicalStringColliders;
 
   // State management
   private currentState: GuitarState = 'HOLDING';
@@ -17,9 +22,9 @@ export class SceneManager {
   private targetQuaternion = new THREE.Quaternion();
 
   // Persistent Room Anchor (when placed on wall/floor)
-  public roomAnchorPosition = new THREE.Vector3(0.6, -0.2, -1.2);
+  public roomAnchorPosition = new THREE.Vector3(0.65, -0.2, -1.2);
   public roomAnchorQuaternion = new THREE.Quaternion().setFromEuler(
-    new THREE.Euler(0.2, -0.4, 1.35) // Leaning at a natural angle against the wall
+    new THREE.Euler(0.2, -0.4, 1.35)
   );
 
   // Studio Lighting
@@ -28,25 +33,23 @@ export class SceneManager {
   private rimLight: THREE.DirectionalLight;
   private ambientLight: THREE.AmbientLight;
 
-  // Shadow Catcher Plane
+  // Shadow Catcher Plane & Room Spatial Grid
   private shadowPlane: THREE.Mesh;
+  private roomGrid: THREE.GridHelper;
 
   // Transition smoothing
   private transitionAlpha = 1.0;
-  private transitionDuration = 0.15; // 150ms smooth Hermite transition
+  private transitionDuration = 0.15;
 
   constructor(canvas: HTMLCanvasElement) {
     this.scene = new THREE.Scene();
-    
-    // Transparent scene background to cleanly composite over the webcam video
     this.scene.background = null;
 
     const width = canvas.clientWidth || window.innerWidth;
     const height = canvas.clientHeight || window.innerHeight;
 
-    // Field of view matched closely to standard 720p/1080p webcam optics (~55-60 deg)
     this.camera = new THREE.PerspectiveCamera(54, width / height, 0.05, 50);
-    this.camera.position.set(0, 0, 1.5);
+    this.camera.position.set(0, 0, 1.6);
 
     this.renderer = new THREE.WebGLRenderer({
       canvas,
@@ -59,19 +62,25 @@ export class SceneManager {
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
-    // Initialize 3D Guitar Model
+    // 1. Initialize 3D Guitar Model
     this.guitar = new ProceduralGuitar3D();
     this.scene.add(this.guitar.group);
 
-    // Initialize Kinematics Solver
+    // 2. Initialize Biomechanical MoCap Skeleton Rig (75 joints)
+    this.skeletonRig = new SkeletonRig();
+    this.scene.add(this.skeletonRig.group);
+
+    // 3. Initialize Physical Colliders
+    this.colliders = new PhysicalStringColliders();
+
+    // 4. Kinematics
     this.kinematics = new GuitarKinematics();
 
-    // Studio Lighting Rig
-    this.ambientLight = new THREE.AmbientLight(0xffffff, 0.85);
+    // 5. Lighting
+    this.ambientLight = new THREE.AmbientLight(0xffffff, 0.9);
     this.scene.add(this.ambientLight);
 
-    // Warm Key Light (mimics desk/room lamp)
-    this.keyLight = new THREE.DirectionalLight(0xfffaed, 2.2);
+    this.keyLight = new THREE.DirectionalLight(0xfffaed, 2.4);
     this.keyLight.position.set(1.5, 2.5, 2.0);
     this.keyLight.castShadow = true;
     this.keyLight.shadow.mapSize.width = 1024;
@@ -79,24 +88,29 @@ export class SceneManager {
     this.keyLight.shadow.bias = -0.0005;
     this.scene.add(this.keyLight);
 
-    // Cool Fill Light (balances shadows)
-    this.fillLight = new THREE.DirectionalLight(0xe0f2fe, 1.0);
+    this.fillLight = new THREE.DirectionalLight(0xe0f2fe, 1.1);
     this.fillLight.position.set(-2.0, 1.0, 1.0);
     this.scene.add(this.fillLight);
 
-    // Rim Light (highlights contours & chrome frets)
-    this.rimLight = new THREE.DirectionalLight(0xffffff, 1.5);
+    this.rimLight = new THREE.DirectionalLight(0xffffff, 1.6);
     this.rimLight.position.set(0, -1.5, -1.0);
     this.scene.add(this.rimLight);
 
-    // Shadow Catcher (Ground / Wall plane)
-    const planeGeo = new THREE.PlaneGeometry(8, 8);
+    // 6. Shadow Plane & Spatial Room Floor Grid
+    const planeGeo = new THREE.PlaneGeometry(10, 10);
     const planeMat = new THREE.ShadowMaterial({ opacity: 0.35 });
     this.shadowPlane = new THREE.Mesh(planeGeo, planeMat);
-    this.shadowPlane.position.set(0, -0.8, -0.5);
+    this.shadowPlane.position.set(0, -0.85, -0.5);
     this.shadowPlane.rotation.x = -Math.PI / 2;
     this.shadowPlane.receiveShadow = true;
     this.scene.add(this.shadowPlane);
+
+    // Laser Room Spatial Grid (Visualizes room tracking)
+    this.roomGrid = new THREE.GridHelper(6, 24, 0x06b6d4, 0x1e293b);
+    this.roomGrid.position.set(0, -0.84, -0.5);
+    this.roomGrid.material.transparent = true;
+    this.roomGrid.material.opacity = 0.25;
+    this.scene.add(this.roomGrid);
 
     window.addEventListener('resize', this.onResize);
   }
@@ -118,52 +132,71 @@ export class SceneManager {
   public setState(newState: GuitarState): void {
     if (this.currentState !== newState) {
       this.currentState = newState;
-      this.transitionAlpha = 0.0; // Trigger smooth Hermite blend
+      this.transitionAlpha = 0.0;
     }
   }
 
-  /**
-   * Sets the 3D room coordinates where the guitar is placed against a wall
-   */
-  public setRoomAnchor(pos: THREE.Vector3, quat: THREE.Quaternion): void {
-    this.roomAnchorPosition.copy(pos);
-    this.roomAnchorQuaternion.copy(quat);
+  public setFloorLevel(floorY: number): void {
+    this.shadowPlane.position.y = floorY;
+    this.roomGrid.position.y = floorY + 0.001;
   }
 
   /**
-   * Update called every frame
+   * Updates per frame: updates skeleton rig, checks physical string collisions, animates guitar
    */
-  public update(deltaTime: number, playerTransform?: GuitarTransform | null): void {
-    // 1. Update Guitar String Oscillation
+  public update(
+    deltaTime: number,
+    skeletonData: FullBodySkeletonData,
+    playerTransform?: GuitarTransform | null,
+    rightHandLandmarks?: Vector3D[] | null
+  ): StringCollisionEvent[] {
+    // 1. Update Full-Body MoCap Skeleton
+    this.skeletonRig.update(skeletonData);
+
+    // 2. Update Guitar String Oscillation
     this.guitar.update(deltaTime);
 
-    // 2. Handle State Transitions
+    // 3. State-based positioning
     if (this.currentState === 'HOLDING' && playerTransform) {
       this.targetPosition.copy(playerTransform.position);
       this.targetQuaternion.copy(playerTransform.quaternion);
       this.guitar.group.scale.setScalar(playerTransform.scale);
-    } else if (this.currentState === 'PLACED_RESTING' || this.currentState === 'PROXIMITY_HOVER') {
+    } else {
       this.targetPosition.copy(this.roomAnchorPosition);
       this.targetQuaternion.copy(this.roomAnchorQuaternion);
       this.guitar.group.scale.setScalar(1.0);
     }
 
-    // 3. Smooth Hermite interpolation to target pose
+    // 4. Smooth Hermite interpolation
     if (this.transitionAlpha < 1.0) {
       this.transitionAlpha = Math.min(1.0, this.transitionAlpha + deltaTime / this.transitionDuration);
-      // Smoothstep curve: 3x^2 - 2x^3
       const t = this.transitionAlpha * this.transitionAlpha * (3 - 2 * this.transitionAlpha);
       this.guitar.group.position.lerp(this.targetPosition, t);
       this.guitar.group.quaternion.slerp(this.targetQuaternion, t);
     } else {
-      // Direct smooth follow
-      const followSpeed = this.currentState === 'HOLDING' ? 0.35 : 0.15;
+      const followSpeed = this.currentState === 'HOLDING' ? 0.38 : 0.15;
       this.guitar.group.position.lerp(this.targetPosition, followSpeed);
       this.guitar.group.quaternion.slerp(this.targetQuaternion, followSpeed);
     }
 
-    // 4. Render
+    // 5. Test Physical Fingertip Collisions against 3D Strings
+    this.guitar.group.updateMatrixWorld(true);
+    this.colliders.updateStringWorldPositions(this.guitar);
+    const collisions = this.colliders.testCollisions(rightHandLandmarks ?? null);
+
+    // Trigger visual deflection on struck strings
+    for (const hit of collisions) {
+      this.guitar.vibrateString(hit.stringIndex, hit.velocity);
+    }
+
+    // 6. Render
     this.renderer.render(this.scene, this.camera);
+
+    return collisions;
+  }
+
+  public toggleSkeleton(visible: boolean): void {
+    this.skeletonRig.setVisibility(visible);
   }
 
   public destroy(): void {
