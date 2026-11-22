@@ -9,6 +9,7 @@ node_modules
 # Production
 /dist
 /build
+*.tsbuildinfo
 
 # Misc
 .DS_Store
