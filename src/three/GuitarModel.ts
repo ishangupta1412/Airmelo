@@ -170,6 +170,18 @@ export class ProceduralGuitar3D {
     soundholeMesh.position.z += 0.0005;
     this.group.add(soundholeMesh);
 
+    // Interactive 3D Strumming Plane Visualizer (Cyberpunk Amber Glow)
+    const strumPlaneGeom = new THREE.PlaneGeometry(0.09, 0.12);
+    const strumPlaneMat = new THREE.MeshBasicMaterial({
+      color: 0xf59e0b,
+      transparent: true,
+      opacity: 0.12,
+      side: THREE.DoubleSide,
+    });
+    const strumPlane = new THREE.Mesh(strumPlaneGeom, strumPlaneMat);
+    strumPlane.position.set(this.soundholePosition.x, 0, 0.015);
+    this.group.add(strumPlane);
+
     // Wooden Bridge
     this.bridgePosition.set(-0.11, 0, 0.005);
     const bridgeGeom = new THREE.BoxGeometry(0.035, 0.13, 0.012);

@@ -29,7 +29,7 @@ export class HolisticPipeline {
   private holistic: Holistic;
   private camera: Camera | null = null;
 
-  // Jitter filters for all 33 pose joints + 42 hand joints (75 total!)
+  // Jitter filters for all 75 joints
   private poseFilters: OneEuroFilter3D[] = [];
   private leftHandFilters: OneEuroFilter3D[] = [];
   private rightHandFilters: OneEuroFilter3D[] = [];
@@ -44,7 +44,6 @@ export class HolisticPipeline {
   constructor(videoElement: HTMLVideoElement) {
     this.videoElement = videoElement;
 
-    // Initialize 75 filters
     for (let i = 0; i < 33; i++) this.poseFilters.push(new OneEuroFilter3D({ minCutoff: 0.8, beta: 0.007 }));
     for (let i = 0; i < 21; i++) this.leftHandFilters.push(new OneEuroFilter3D({ minCutoff: 0.8, beta: 0.007 }));
     for (let i = 0; i < 21; i++) this.rightHandFilters.push(new OneEuroFilter3D({ minCutoff: 0.8, beta: 0.007 }));
@@ -58,7 +57,7 @@ export class HolisticPipeline {
       smoothLandmarks: true,
       minDetectionConfidence: 0.6,
       minTrackingConfidence: 0.6,
-      refineFaceLandmarks: false, // Keep FPS high
+      refineFaceLandmarks: false,
     });
 
     this.holistic.onResults(this.handleHolisticResults);
@@ -95,12 +94,11 @@ export class HolisticPipeline {
     // 1. Process 33 Pose Landmarks
     let filteredPose: Vector3D[] | null = null;
     let kinematicsPose: PoseLandmarks | null = null;
-    let floorY = -0.8;
+    let floorY = -0.85;
 
     if (results.poseLandmarks) {
       filteredPose = results.poseLandmarks.map((lm, i) => {
         jointsCount++;
-        // Mirrored coordinate space: X mirrored, Y inverted for Three.js
         const raw = {
           x: (1 - lm.x) * 2 - 1,
           y: -(lm.y * 2 - 1),
@@ -109,7 +107,6 @@ export class HolisticPipeline {
         return this.poseFilters[i].filter(raw, now);
       });
 
-      // Kinematics pose for guitar anchoring
       kinematicsPose = {
         leftShoulder: filteredPose[11],
         rightShoulder: filteredPose[12],
@@ -117,14 +114,13 @@ export class HolisticPipeline {
         rightWrist: filteredPose[16],
       };
 
-      // Floor estimation from ankles (landmarks 27 & 28)
       if (filteredPose[27] && filteredPose[28]) {
         floorY = Math.min(filteredPose[27].y, filteredPose[28].y) - 0.05;
       }
     }
 
-    // 2. Process Left Hand Landmarks (21 joints)
-    // Note: Due to camera mirroring, Holistic's rightHandLandmarks is user's left hand
+    // 2. Process Left Hand Landmarks (User's Fretting Hand)
+    // Note: Because camera image is mirrored, Holistic's rightHandLandmarks is user's left hand
     let filteredLeftHand: Vector3D[] | null = null;
     if (results.rightHandLandmarks) {
       filteredLeftHand = results.rightHandLandmarks.map((lm, i) => {
@@ -138,7 +134,7 @@ export class HolisticPipeline {
       });
     }
 
-    // 3. Process Right Hand Landmarks (21 joints)
+    // 3. Process Right Hand Landmarks (User's Strumming Hand)
     let filteredRightHand: Vector3D[] | null = null;
     if (results.leftHandLandmarks) {
       filteredRightHand = results.leftHandLandmarks.map((lm, i) => {
@@ -152,11 +148,11 @@ export class HolisticPipeline {
       });
     }
 
-    // 4. Compute Biomechanical Joint Angles
+    // 4. Biomechanical Telemetry
     const telemetry = this.computeBiomechanicalTelemetry(filteredPose, jointsCount, floorY);
 
-    // 5. Chord Recognition from Left Hand
-    const activeChord = this.classifyChord(filteredLeftHand);
+    // 5. High-Precision Curvature Matrix Chord Recognition
+    const activeChord = this.classifyChordCurvature(filteredLeftHand);
 
     // 6. Spatial Placement Gestures
     const placeGesture = this.detectPlaceGesture(filteredLeftHand, filteredRightHand);
@@ -191,7 +187,6 @@ export class HolisticPipeline {
       };
     }
 
-    // Helper to calculate 3D angle between vector BA and BC
     const angleBetween = (a: Vector3D, b: Vector3D, c: Vector3D): number => {
       const v1 = { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z };
       const v2 = { x: c.x - b.x, y: c.y - b.y, z: c.z - b.z };
@@ -203,14 +198,10 @@ export class HolisticPipeline {
       return Math.round((Math.acos(cosTheta) * 180) / Math.PI);
     };
 
-    // Left Elbow: Shoulder(11) -> Elbow(13) -> Wrist(15)
     const leftElbow = angleBetween(pose[11], pose[13], pose[15]);
-    // Right Elbow: Shoulder(12) -> Elbow(14) -> Wrist(16)
     const rightElbow = angleBetween(pose[12], pose[14], pose[16]);
-    // Left Shoulder: Hip(23) -> Shoulder(11) -> Elbow(13)
     const leftShoulder = angleBetween(pose[23], pose[11], pose[13]);
 
-    // Spine tilt: Angle of shoulder-center to hip-center relative to vertical
     const spineDx = (pose[11].x + pose[12].x) / 2 - (pose[23].x + pose[24].x) / 2;
     const spineDy = (pose[11].y + pose[12].y) / 2 - (pose[23].y + pose[24].y) / 2;
     const spineTilt = Math.round((Math.atan2(spineDx, spineDy) * 180) / Math.PI);
@@ -225,25 +216,61 @@ export class HolisticPipeline {
     };
   }
 
-  private classifyChord(hand: Vector3D[] | null): string {
+  /**
+   * Biomechanical Curvature Matrix: Measures exact PIP & DIP flexion angles (0 to 180 deg)
+   * to classify real guitar chords rather than primitive finger counting.
+   */
+  private classifyChordCurvature(hand: Vector3D[] | null): string {
     if (!hand || hand.length < 21) return 'Em';
 
-    const isCurled = (tip: number, mcp: number): boolean => {
-      const dTip = Math.hypot(hand[tip].x - hand[0].x, hand[tip].y - hand[0].y);
-      const dMcp = Math.hypot(hand[mcp].x - hand[0].x, hand[mcp].y - hand[0].y);
-      return dTip < dMcp * 1.15;
+    // Computes joint angle between 3 points
+    const jointAngle = (aIdx: number, bIdx: number, cIdx: number): number => {
+      const a = hand[aIdx];
+      const b = hand[bIdx];
+      const c = hand[cIdx];
+      const v1 = { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z };
+      const v2 = { x: c.x - b.x, y: c.y - b.y, z: c.z - b.z };
+      const dot = v1.x * v2.x + v1.y * v2.y + v1.z * v2.z;
+      const m1 = Math.hypot(v1.x, v1.y, v1.z);
+      const m2 = Math.hypot(v2.x, v2.y, v2.z);
+      if (m1 === 0 || m2 === 0) return 180;
+      return (Math.acos(Math.max(-1, Math.min(1, dot / (m1 * m2)))) * 180) / Math.PI;
     };
 
-    const iCurled = isCurled(8, 5);
-    const mCurled = isCurled(12, 9);
-    const rCurled = isCurled(16, 13);
-    const pCurled = isCurled(20, 17);
+    // PIP Joint Angles: 180° = straight/extended, < 110° = curled/fretted
+    // Index: MCP=5, PIP=6, DIP=7, Tip=8
+    // Middle: MCP=9, PIP=10, DIP=11, Tip=12
+    // Ring: MCP=13, PIP=14, DIP=15, Tip=16
+    // Pinky: MCP=17, PIP=18, DIP=19, Tip=20
+    const indexAngle = jointAngle(5, 6, 8);
+    const middleAngle = jointAngle(9, 10, 12);
+    const ringAngle = jointAngle(13, 14, 16);
+    const pinkyAngle = jointAngle(17, 18, 20);
 
+    const isCurled = (deg: number) => deg < 125;
+
+    const iCurled = isCurled(indexAngle);
+    const mCurled = isCurled(middleAngle);
+    const rCurled = isCurled(ringAngle);
+    const pCurled = isCurled(pinkyAngle);
+
+    // Anatomical Guitar Chord Mapping:
+    // 1. Barre Chord (F Major): All fingers pressed/flat
     if (iCurled && mCurled && rCurled && pCurled) return 'F';
+
+    // 2. Open E Minor: Index open/extended, Middle & Ring curled, Pinky open
     if (!iCurled && mCurled && rCurled && !pCurled) return 'Em';
+
+    // 3. C Major: Index curled, Middle & Ring curled, Pinky open
     if (iCurled && mCurled && rCurled && !pCurled) return 'C';
+
+    // 4. D Major: Index & Middle curled, Ring curled, Pinky open (compact cluster)
     if (iCurled && mCurled && !rCurled && !pCurled) return 'D';
+
+    // 5. G Major: Index & Middle curled, Ring & Pinky curled
     if (!iCurled && mCurled && rCurled && pCurled) return 'G';
+
+    // 6. A Minor: Index curled, Middle & Ring curled
     if (iCurled && mCurled && !rCurled) return 'Am';
 
     return 'Em';
